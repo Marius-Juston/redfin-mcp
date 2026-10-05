@@ -12,6 +12,7 @@ This is a "Pattern A" fetchproxy MCP (every call rides through fetchproxy), not 
 
 | Tool | File | Endpoint(s) | Kind |
 | --- | --- | --- | --- |
+| `redfin_sweep_area` | `tools/search.ts` | `GET /stingray/api/gis?poly=…` per tile, quartering any tile that returns the 350-home cap | read (optional local file write) |
 | `redfin_search_properties` | `tools/search.ts` | (a) `GET /stingray/do/location-autocomplete?location=…` → region OR address<br>(b) `GET /stingray/api/gis?region_id=…&region_type=…&…` (region path) — address path short-circuits to a 1-result reply | read |
 | `redfin_get_by_address` | `tools/get-by-address.ts` | `GET /stingray/do/location-autocomplete?location=…` → first `Addresses` row → parse `/home/<id>` | read |
 | `redfin_get_property` | `tools/properties.ts` | (a) `GET /stingray/api/home/details/initialInfo?path=…` → propertyId+listingId<br>(b) `GET /stingray/api/home/details/aboveTheFold?propertyId=…&listingId=…` | read |
@@ -68,7 +69,8 @@ src/
   view.ts               # the `view` rung vocabulary (compact | full) — viewArg()
                         #   for the schema, viewResponse() for the return
   tools/                # one registerXxxTools(server, client) per file (16):
-    search.ts           # redfin_search_properties (buildGisPath + formatHome)
+    search.ts           # redfin_search_properties (buildGisPath + formatHome),
+                        #   buildGisPolyPath (drawn-map polygon), redfin_sweep_area
     properties.ts       # redfin_get_property (initialInfo + ATF/BTF)
     get-by-address.ts   # redfin_get_by_address (single-address resolve)
     bulk-get.ts         # redfin_bulk_get (concurrent ATF/BTF fan-out)
