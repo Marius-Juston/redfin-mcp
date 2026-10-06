@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute } from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/server';
 import type { RedfinClient } from '../client.js';
 import { minifiedResult, unwrapValue as v } from '../mcp.js';
@@ -296,6 +296,9 @@ function discriminatingTokens(s: string | undefined): Set<string> {
  * Redfin MLS coverage will get an empty result with a notice from the
  * caller).
  */
+/** gis `region_type` of a ZIP-code region (see GIS_REGION_TYPE in autocomplete.ts). */
+const ZIP_REGION_TYPE = 2;
+
 export function assertRegionMatches(
   region: { name: string; sub_name?: string; region_type: number; region_id: number },
   payload: {
@@ -334,7 +337,9 @@ export function assertRegionMatches(
   // cities gis reports a neighborhood-style serviceRegionName (e.g.
   // "berryessa-alum-rock" for 95133) that never shares a token with the
   // ZIP's name, so the name checks below would reject a correct answer.
-  if (zip) {
+  // Only for a ZIP *region*: "San Jose, CA 95133" can resolve to the city,
+  // whose homes legitimately span many ZIPs.
+  if (zip && region.region_type === ZIP_REGION_TYPE) {
     const withZip = (payload.homes ?? []).filter((h) => h.zip);
     if (withZip.length > 0) {
       const inZip = withZip.filter((h) => h.zip === zip).length;
@@ -386,9 +391,6 @@ export function assertRegionMatches(
   );
 }
 
-/**
- * Build the gis endpoint path + params for a resolved region + filters.
- */
 export interface Bounds { north: number; south: number; east: number; west: number }
 
 /** Redfin's drawn-map polygon param: "lng lat,lng lat,..." closed ring. */
@@ -465,6 +467,8 @@ export interface PolyFetch {
   /** The request shape whose homes fell inside the box; null when none did. */
   variant: PolyVariant | null;
   tried: Array<{ variant: PolyVariant; raw: number; outside: number }>;
+  /** True when `maxRequests` cut the probe short before every shape was tried. */
+  truncated: boolean;
 }
 
 /** Homes are "area-limited" when at most 20% (min 2) fall outside the box. */
@@ -475,19 +479,21 @@ export function areaLimited(raw: number, outside: number): boolean {
 /**
  * Fetch one box. With `variant` set, uses only that shape; otherwise probes
  * POLY_VARIANTS (skipping the region one when no region is known) and keeps
- * the first area-limited answer.
+ * the first area-limited answer. `maxRequests` caps how many shapes are tried.
  */
 export async function fetchPolyHomes(
   client: RedfinClient,
   bounds: Bounds,
   input: SearchInput,
-  opts: { variant?: PolyVariant; region?: { region_id: number; region_type: number } } = {}
+  opts: { variant?: PolyVariant; region?: { region_id: number; region_type: number }; maxRequests?: number } = {}
 ): Promise<PolyFetch> {
-  const candidates = opts.variant
+  const all = opts.variant
     ? [opts.variant]
     : POLY_VARIANTS.filter((v) => (v !== 'user_poly_region' && v !== 'viewport_region') || opts.region);
+  const candidates = all.slice(0, Math.max(0, opts.maxRequests ?? all.length));
+  const truncated = candidates.length < all.length;
   const tried: PolyFetch['tried'] = [];
-  let last: Omit<PolyFetch, 'variant' | 'tried'> = { raw: [], formatted: [], outside: 0 };
+  let last: Omit<PolyFetch, 'variant' | 'tried' | 'truncated'> = { raw: [], formatted: [], outside: 0 };
   for (const v of candidates) {
     const env = await client.fetchStingrayJson<{ homes?: RawHome[] }>(buildGisPolyPath(bounds, input, v, opts.region));
     const raw = env.payload?.homes ?? [];
@@ -495,11 +501,14 @@ export async function fetchPolyHomes(
     const outside = formatted.filter((h) => homeOutside(h, bounds)).length;
     tried.push({ variant: v, raw: raw.length, outside });
     last = { raw, formatted, outside };
-    if (areaLimited(raw.length, outside)) return { ...last, variant: v, tried };
+    if (areaLimited(raw.length, outside)) return { ...last, variant: v, tried, truncated: false };
   }
-  return { ...last, variant: null, tried };
+  return { ...last, variant: null, tried, truncated };
 }
 
+/**
+ * Build the gis endpoint path + params for a resolved region + filters.
+ */
 export function buildGisPath(
   region: { region_id: number; region_type: number },
   input: SearchInput
@@ -787,7 +796,7 @@ export function registerSearchTools(
     {
       title: 'Exhaustively sweep a Redfin map area',
       description:
-        "Enumerate EVERY for-sale Redfin listing inside a bounding box without silent truncation. Redfin's gis API returns at most 350 homes per call and ignores server-side filters, so this tool searches drawn-map polygons, recursively quarters any tile that hits the cap, dedupes by property_id and re-applies the caller's filters locally. Returns a completeness summary (requests, tiles, unique listings, tiles still capped at max depth, drift warnings such as homes returned outside the polygon = poly ignored) plus the listings, or writes the listings to `output_path` as JSON for large areas. Sequential requests with a delay. Read-only against Redfin; the only write is the optional local output file.",
+        "Enumerate EVERY for-sale Redfin listing inside a bounding box without silent truncation. Redfin's gis API returns at most 350 homes per call and ignores server-side filters, so this tool searches drawn-map polygons, recursively quarters any tile that hits the cap, dedupes by property_id and re-applies the caller's filters locally. Homes outside the box and tiles where Redfin drifted to another region are left out. Alternatively pass `zips` (ZIP mode) to sweep a list of ZIP regions instead of map tiles, when Redfin ignores drawn-map polygons. Returns a completeness summary (requests, tiles or ZIPs, unique listings, tiles/ZIPs still at the cap, drift warnings) plus the listings inline by default; pass the optional `output_path` to write them to a new JSON file instead, for large areas. Sequential requests with a delay. Read-only against Redfin; the only write is the optional local output file.",
       annotations: { title: 'Sweep Redfin area', readOnlyHint: false, idempotentHint: true, openWorldHint: true },
       inputSchema: z.object({
         bounds: z
@@ -808,7 +817,7 @@ export function registerSearchTools(
         max_depth: z.number().int().min(0).max(8).optional().describe('Max quarterings per tile (default 6).'),
         delay_ms: z.number().int().min(0).max(10000).optional().describe('Pause between requests (default 1200).'),
         max_requests: z.number().int().positive().max(400).optional().describe('Hard request budget (default 120).'),
-        output_path: z.string().optional().describe('Optional absolute path of a JSON file to write the full results (and per-tile counts) to. Omit to get the results inline; use a file for large areas so the listings stay out of the conversation.'),
+        output_path: z.string().optional().describe('Optional absolute path of a NEW JSON file to write the full results (and per-tile counts) to; a relative path or an existing file is refused rather than overwritten. Omit to get the results inline; use a file for large areas so the listings stay out of the conversation.'),
       }),
     },
     async (input) => minifiedResult(await sweepRedfinArea(client, input))
@@ -830,7 +839,36 @@ export interface RedfinSweepInput {
   output_path?: string;
 }
 
+/**
+ * Refuse an output_path that is relative or already exists, before any
+ * request is sent — a relative path would land wherever the server's cwd
+ * happens to be, and an existing file may be someone's earlier sweep.
+ */
+export function assertSweepOutputPath(path: string | undefined): void {
+  if (path === undefined) return;
+  if (!isAbsolute(path)) {
+    throw new Error(`redfin_sweep_area: output_path must be an absolute path (got "${path}").`);
+  }
+  if (existsSync(path)) {
+    throw new Error(`redfin_sweep_area: output_path "${path}" already exists — refusing to overwrite it. Pass a new file name, or delete the old file first.`);
+  }
+}
+
+/** Write a sweep's full result set; 'wx' keeps a file created mid-sweep safe too. */
+function writeSweepFile(path: string, data: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  try {
+    writeFileSync(path, JSON.stringify(data, null, 1), { flag: 'wx' });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error(`redfin_sweep_area: output_path "${path}" was created by something else during the sweep — refusing to overwrite it. Re-run with a new file name.`);
+    }
+    throw e;
+  }
+}
+
 export async function sweepRedfinArea(client: RedfinClient, input: RedfinSweepInput) {
+  assertSweepOutputPath(input.output_path);
   if (input.zips && input.zips.length > 0) return sweepRedfinZips(client, input);
   if (!input.bounds) throw new Error('redfin_sweep_area: pass `bounds` (map mode) or `zips` (ZIP mode).');
   const rootBounds = input.bounds;
@@ -856,10 +894,16 @@ export async function sweepRedfinArea(client: RedfinClient, input: RedfinSweepIn
     const t = queue.shift()!;
     if (requests >= budget) { budgetHit = true; tiles.push({ id: t.id, bounds: t.b, depth: t.depth, raw: -1, capped: true, split: false, matched: 0, outside: 0 }); continue; }
     if (delay && requests > 0) await sleep(delay);
-    const f = await fetchPolyHomes(client, t.b, filt, { variant, region: pin });
+    const f = await fetchPolyHomes(client, t.b, filt, { variant, region: pin, maxRequests: budget - requests });
     requests += f.tried.length;
     if (variant === undefined) {
       probe = f.tried;
+      if (f.variant === null && f.truncated) {
+        // The budget ran out mid-probe: no verdict on the polygon either way.
+        budgetHit = true;
+        tiles.push({ id: t.id, bounds: t.b, depth: t.depth, raw: f.raw.length, capped: true, split: false, matched: 0, outside: f.outside });
+        break;
+      }
       if (f.variant === null) {
         // No request shape is area-limited: tiling would only re-fetch the same
         // fallback region, so stop and report instead of returning a fake census.
@@ -873,11 +917,16 @@ export async function sweepRedfinArea(client: RedfinClient, input: RedfinSweepIn
     const { raw, formatted, outside } = f;
     const capped = raw.length >= REDFIN_GIS_HARD_CAP;
     if (!areaLimited(raw.length, outside)) {
+      // Drifted: these homes belong to Redfin's fallback region, not this tile,
+      // so neither count them nor spend budget splitting the tile.
       driftTiles++;
-      warnings.add('Some tiles came back mostly outside their box although the probe passed — Redfin drift mid-sweep; those tiles count as incomplete.');
-    } else if (outside > 0) warnings.add('Some homes came back slightly outside their tile (boundary / geocode jitter); deduped by property_id.');
+      warnings.add('Some tiles came back mostly outside their box although the probe passed — Redfin drift mid-sweep; those tiles were skipped and count as incomplete.');
+      tiles.push({ id: t.id, bounds: t.b, depth: t.depth, raw: raw.length, capped: false, split: false, matched: 0, outside });
+      continue;
+    }
+    if (outside > 0) warnings.add('Some homes came back slightly outside their tile (boundary / geocode jitter); deduped by property_id, and homes outside the requested box dropped.');
     const needsSplit = capped && t.depth < maxDepth;
-    const matching = formatted.filter((h) => matchesFilters(h, filt));
+    const matching = formatted.filter((h) => matchesFilters(h, filt) && !homeOutside(h, rootBounds));
     tiles.push({ id: t.id, bounds: t.b, depth: t.depth, raw: raw.length, capped: capped && !needsSplit, split: needsSplit, matched: matching.length, outside });
     if (needsSplit) { quarterBounds(t.b).forEach((q, k) => queue.push({ id: `${t.id}${k}`, b: q, depth: t.depth + 1 })); continue; }
     for (const h of matching) {
@@ -904,10 +953,7 @@ export async function sweepRedfinArea(client: RedfinClient, input: RedfinSweepIn
     warnings: [...warnings],
     results: [...byId.values()],
   };
-  if (input.output_path) {
-    mkdirSync(dirname(input.output_path), { recursive: true });
-    writeFileSync(input.output_path, JSON.stringify(out, null, 1));
-  }
+  if (input.output_path) writeSweepFile(input.output_path, out);
   return {
     ...(input.output_path ? { output_path: input.output_path } : {}),
     complete: out.complete,
@@ -933,6 +979,7 @@ export async function sweepRedfinArea(client: RedfinClient, input: RedfinSweepIn
  * capped and the sweep is marked incomplete.
  */
 export async function sweepRedfinZips(client: RedfinClient, input: RedfinSweepInput) {
+  assertSweepOutputPath(input.output_path);
   const delay = input.delay_ms ?? 1200;
   const budget = input.max_requests ?? 120;
   const filt: SearchInput = { location: '', price_min: input.price_min, price_max: input.price_max, beds_min: input.beds_min, baths_min: input.baths_min, home_types: input.home_types };
@@ -979,10 +1026,7 @@ export async function sweepRedfinZips(client: RedfinClient, input: RedfinSweepIn
     ],
     results: [...byId.values()],
   };
-  if (input.output_path) {
-    mkdirSync(dirname(input.output_path), { recursive: true });
-    writeFileSync(input.output_path, JSON.stringify(out, null, 1));
-  }
+  if (input.output_path) writeSweepFile(input.output_path, out);
   return {
     ...(input.output_path ? { output_path: input.output_path } : {}),
     mode: 'zips' as const,

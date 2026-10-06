@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RedfinClient } from '../../src/client.js';
 import {
+  fetchPolyHomes,
   boundsToPoly,
   buildGisPolyPath,
   homeOutside,
@@ -117,6 +118,61 @@ describe('sweepRedfinArea', () => {
   });
 });
 
+describe('sweepRedfinArea — follow-ups from #272', () => {
+  it('drops homes outside the requested box even when the tile is area-limited', async () => {
+    // 1 of 10 homes is well outside the root box: areaLimited tolerates it, the census must not.
+    const homes = [...Array.from({ length: 9 }, (_, i) => home(i + 1, 700000)), home(99, 700000, 37.6, -121.9)];
+    fetchStingrayJson.mockResolvedValueOnce({ payload: { homes } });
+    const s = await sweepRedfinArea(client, { bounds: box, delay_ms: 0 });
+    expect(s.results?.map((r) => r.property_id)).not.toContain(99);
+    expect(s.unique_listings).toBe(9);
+  });
+  it('neither merges nor splits a tile that drifted after the probe passed', async () => {
+    const capped = Array.from({ length: REDFIN_GIS_HARD_CAP }, (_, i) => home(i + 1, 700000));
+    const drifted = Array.from({ length: REDFIN_GIS_HARD_CAP }, (_, i) => home(10_000 + i, 700000, 40.7, -74.0));
+    fetchStingrayJson
+      .mockResolvedValueOnce({ payload: { homes: capped } }) // root: probe passes, capped → split
+      .mockResolvedValueOnce({ payload: { homes: drifted } }) // q0 drifts (and is "capped")
+      .mockResolvedValueOnce({ payload: { homes: [home(5000, 700000, 37.35, -121.85)] } })
+      .mockResolvedValueOnce({ payload: { homes: [] } })
+      .mockResolvedValueOnce({ payload: { homes: [] } });
+    const s = await sweepRedfinArea(client, { bounds: box, delay_ms: 0 });
+    expect(s.requests).toBe(5); // the drifted tile is not quartered
+    expect(s.drift_tiles).toBe(1);
+    expect(s.complete).toBe(false);
+    expect(s.results?.map((r) => r.property_id)).toEqual([5000]);
+  });
+  it('never sends more polygon probes than max_requests allows', async () => {
+    fetchStingrayJson.mockResolvedValue({ payload: { homes: Array.from({ length: 10 }, (_, i) => home(i + 1, 1, 40.7, -74.0)) } });
+    const s = await sweepRedfinArea(client, { bounds: box, delay_ms: 0, max_requests: 1 });
+    expect(fetchStingrayJson).toHaveBeenCalledTimes(1);
+    expect(s.requests).toBe(1);
+    expect(s.budget_hit).toBe(true);
+    expect(s.complete).toBe(false);
+    // Budget ran out mid-probe: that is not evidence Redfin ignored the polygon.
+    expect(s.warnings.join(' ')).not.toMatch(/ignored every polygon request shape/);
+  });
+  it('fetchPolyHomes stops probing at maxRequests', async () => {
+    fetchStingrayJson.mockResolvedValue({ payload: { homes: Array.from({ length: 10 }, (_, i) => home(i + 1, 1, 40.7, -74.0)) } });
+    const f = await fetchPolyHomes(client, box, { location: '' }, { maxRequests: 2 });
+    expect(f.tried).toHaveLength(2);
+    expect(f.variant).toBeNull();
+    expect(f.truncated).toBe(true);
+  });
+  it('rejects a relative output_path before sending any request', async () => {
+    await expect(sweepRedfinArea(client, { bounds: box, delay_ms: 0, output_path: 'out/r.json' })).rejects.toThrow(/absolute/);
+    await expect(sweepRedfinArea(client, { zips: ['95133'], delay_ms: 0, output_path: 'r.json' })).rejects.toThrow(/absolute/);
+    expect(fetchStingrayJson).not.toHaveBeenCalled();
+  });
+  it('refuses to overwrite an existing output_path', async () => {
+    const out = join(mkdtempSync(join(tmpdir(), 'rf-')), 'r.json');
+    writeFileSync(out, 'keep me');
+    await expect(sweepRedfinArea(client, { bounds: box, delay_ms: 0, output_path: out })).rejects.toThrow(/already exists/);
+    expect(fetchStingrayJson).not.toHaveBeenCalled();
+    expect(readFileSync(out, 'utf8')).toBe('keep me');
+  });
+});
+
 describe('ZIP regions', () => {
   const ac = (zip: string, id: number) => ({
     resultCode: 0,
@@ -133,6 +189,28 @@ describe('ZIP regions', () => {
     expect(() =>
       assertRegionMatches({ name: '95133', region_type: 2, region_id: 39438 }, { homes: [{ city: 'San Jose', state: 'CA', zip: '95125' }, { city: 'San Jose', state: 'CA', zip: '95128' }] }, '95133')
     ).toThrow(/only 0 of 2/);
+  });
+  it('does not apply the homes-in-ZIP rule when the location resolved to a city', () => {
+    // "San Jose, CA 95133" can resolve to the city; its homes span many ZIPs.
+    expect(() =>
+      assertRegionMatches(
+        { name: 'San Jose', sub_name: 'San Jose, CA, USA', region_type: 6, region_id: 17420 },
+        { serviceRegionName: 'san-jose', homes: [{ city: 'San Jose', state: 'CA', zip: '95125' }, { city: 'San Jose', state: 'CA', zip: '95128' }, { city: 'San Jose', state: 'CA', zip: '95133' }] },
+        'San Jose, CA 95133'
+      )
+    ).not.toThrow();
+  });
+  it('stops a ZIP sweep at the request budget', async () => {
+    fetchStingrayJson
+      .mockResolvedValueOnce(ac('95133', 1)).mockResolvedValueOnce({ payload: { homes: [zh(1, '95133')] } })
+      .mockResolvedValueOnce(ac('95131', 2)).mockResolvedValueOnce({ payload: { homes: [zh(2, '95131')] } });
+    const s = await sweepRedfinArea(client, { zips: ['95133', '95131', '95035'], delay_ms: 0, max_requests: 4 });
+    expect(fetchStingrayJson).toHaveBeenCalledTimes(4);
+    expect(s.requests).toBe(4);
+    expect(s.budget_hit).toBe(true);
+    expect(s.complete).toBe(false);
+    expect((s as { failed_zips: Array<{ zip: string; error: string }> }).failed_zips).toEqual([{ zip: '95035', error: 'request budget exhausted' }]);
+    expect(s.results?.map((r) => r.property_id)).toEqual([1, 2]);
   });
   it('sweeps ZIPs, filters locally, flags capped and failed ZIPs', async () => {
     fetchStingrayJson
