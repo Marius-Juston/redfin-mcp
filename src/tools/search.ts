@@ -272,6 +272,9 @@ function discriminatingTokens(s: string | undefined): Set<string> {
   return out;
 }
 
+/** gis `region_type` of a ZIP-code region (see GIS_REGION_TYPE in autocomplete.ts). */
+const ZIP_REGION_TYPE = 2;
+
 /**
  * Throw if the gis call's response doesn't actually describe the
  * requested region. Three failure modes surface here:
@@ -296,9 +299,6 @@ function discriminatingTokens(s: string | undefined): Set<string> {
  * Redfin MLS coverage will get an empty result with a notice from the
  * caller).
  */
-/** gis `region_type` of a ZIP-code region (see GIS_REGION_TYPE in autocomplete.ts). */
-const ZIP_REGION_TYPE = 2;
-
 export function assertRegionMatches(
   region: { name: string; sub_name?: string; region_type: number; region_id: number },
   payload: {
